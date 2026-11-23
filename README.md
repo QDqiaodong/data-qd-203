@@ -41,6 +41,36 @@ publish("run/another-sample.json", result)
 
 已通过 6 项业务测试，另实际核对已有目标、符号链接目标、JSON重复键、非法业务输入和临时发布文件清理。数值和排序语义见契约，不以文件哈希代替业务结果断言。
 
+## 可落盘、可重开的归档 API
+
+`telemetry_trellis.Archive` 在目录上提供三个入口：`submit` 原子提交观测批次（含版本仲裁、回执与下游变更）、`evidence` 按帧查多副本合并证据、`read_changes` 从游标分页拉有序变更。状态经临时文件+fsync+`os.replace`原子落盘，重开后证据、历史变更与批次回执均保留；相同 `batch_id` 的相同请求安全重试并返回原回执。完整字段、版本与发布语义见 [数据契约](docs/contract.md)。
+
+```python
+from telemetry_trellis import Archive
+
+with Archive("run/telemetry-archive") as archive:
+    receipt = archive.submit({
+        "batch_id": "batch-0001",
+        "updates": [{
+            "frame_id": "frame-7", "capture_id": "station-A",
+            "revision": 1, "action": "write",
+            "constraint": 2, "generators": [3, 1],
+            "payload_length": 1, "terminated": False,
+            "received": [0, 1],
+        }],
+    })
+    evidence = archive.evidence("frame-7")
+    page = archive.read_changes(cursor=0, page_size=100)
+```
+
+离线合成数据演示（无设备连接）：
+
+```sh
+PYTHONPATH=src python3 examples/archive_demo.py
+```
+
+测试新增多站合并、撤销与版本仲裁、变更游标与发布边界、批次原子性（含提交前中断与应答丢失重开重试）、终止帧最大负载、全擦除精确路径计数等共 31 项归档/合并测试（含独立状态路径枚举Oracle），原有 `process`、编码器与文件 IO 的 6 项测试保持通过，合计 37 项。运行时仍仅依赖标准库，无第三方依赖。
+
 ## 当前边界与来源
 
 不含真实协议码表、软判概率、交织、同步或CRC。歧义时选择字典序代表但不能当确认信源。
