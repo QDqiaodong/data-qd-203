@@ -1,0 +1,26 @@
+{
+  "constraint": 3,
+  "generators": [
+    7,
+    5
+  ],
+  "frames": [
+    {
+      "id": "block",
+      "payload_length": 3,
+      "terminated": true,
+      "received": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        1
+      ]
+    }
+  ]
+}
