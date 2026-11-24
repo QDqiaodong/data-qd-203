@@ -16,6 +16,7 @@ from .readback import (
     settle_readback,
 )
 from .service import process
+from .session import SessionError, decode_session
 from .streaming import (
     StreamingError,
     append,
@@ -29,7 +30,7 @@ from .streaming import (
 )
 
 __all__ = [
-    'process', 'Archive', 'ArchiveError', 'CrashSimulated',
+    'process', 'decode_session', 'SessionError', 'Archive', 'ArchiveError', 'CrashSimulated',
     'plan_readback', 'settle_readback', 'save_continuation',
     'load_continuation', 'save_order', 'ReadbackError',
     'new_state', 'append', 'replace', 'confirm', 'finish', 'progress',
