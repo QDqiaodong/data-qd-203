@@ -9,9 +9,22 @@ from .readback import (
     settle_readback,
 )
 from .service import process
+from .streaming import (
+    StreamingError,
+    append,
+    confirm,
+    finish,
+    load_state,
+    new_state,
+    progress,
+    replace,
+    save_state,
+)
 
 __all__ = [
     'process', 'Archive', 'ArchiveError', 'CrashSimulated',
     'plan_readback', 'settle_readback', 'save_continuation',
     'load_continuation', 'save_order', 'ReadbackError',
+    'new_state', 'append', 'replace', 'confirm', 'finish', 'progress',
+    'save_state', 'load_state', 'StreamingError',
 ]

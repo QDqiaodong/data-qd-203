@@ -65,3 +65,39 @@ API输入错误抛ValueError，整个结果成功计算后可用io.publish创建
 多个成功窗口覆盖同一坐标只产生一份观测：值相同合并为一份；值冲突则拒绝整次结算，不择一、不投票。只把成功回包填入原帧对应擦除位，其余码元（含不可用窗口覆盖的位置）保持原样；结算不会写向原本已知的位。
 
 结算返回`schedule_id`、`capture_id`、`filled_indices`（实际补入的展开下标，去重升序）、`unavailable_windows`（升序）与`decode`，后者完全是现有单帧译码证据：`distance`、精确`optimal_paths`、`ambiguous`、字典序代表`payload`、`selected_final_state`、`state_path`、`reencoded`、`corrected_indices`、`erasure_indices`。允许任意多个窗口不可用，仍用实际拿到的证据。再译码对补完观测后的**整组合法路径**重新判断，而不是只在原最优负载中筛选，因此原先不最优的路径可能进入并列，结果也不保证唯一。
+
+## 流式遥测提前交付 API（streaming）
+
+`new_state` 为一个尚未结束的记录建立处理状态；`append`、`replace`、`confirm` 推进接收与确认；`finish` 在收尾时给出与一次性 `process` 一致的完整单帧证据。全部为普通 JSON 数据，仅用标准库，不连接设备。每个入口都返回含新状态的报告对象，原状态不被修改；任何非法调用都在产生后继状态之前抛错，因此既不留部分改动，也不产生新交付。
+
+### 状态建立与码元坐标
+
+`new_state(frame_id, constraint, generators, payload_length, terminated)` 的参数范围完全沿用单帧契约：`frame_id` 为 ident（`[A-Za-z0-9_:-]{1,64}`）、`constraint` 为 2..7、`generators` 为 2..4 个不同的正整数掩码且 `<2**constraint`、`payload_length` 为 1..500、`terminated` 为严格布尔。总步数 `steps = payload_length + (constraint-1 if terminated else 0)` 与码元总数 `steps*width` 在建立时确定，后续不能超过。
+
+一切按从 0 起展开的码元坐标操作：第 `j` 步产生码元区间 `[j*width, (j+1)*width)` 并消费信源位 `j`。只有信源位 `0..payload_length-1` 属于负载；终止记录的末尾 `constraint-1` 个零位是尾步，永不属于负载。编码沿用 `register=(state<<1)|bit`、零初态的既有约定。
+
+### 追加、替换与确认
+
+- `append(state, symbols)`：追加一段非空观测，起点必须等于当前已接收长度；分片可在码组内部结束，但不得越过总长。追加不隐式确认、也不交付。
+- `replace(state, start, symbols)`：替换一段非空的、已接收但未确认的观测。目标区间须整体落在 `[confirmed, received_count)`；起点落在确认前缀内（即使新值相同）一律拒绝，跨确认位置也不接受只应用后半段。可在已知值与 null 之间切换。替换不隐式确认、也不交付。
+- `confirm(state, confirmed)`：由调用方推进半开确认前缀的右端；不得倒退、不得超过已接收长度。确认位置不变时不会重发任何位。
+
+`progress(state)` 返回 `received_count`、`confirmed`、`delivered`、`symbol_count` 与 `finished`，让调用方分别获知已接收长度、确认位置与已交付负载长度。
+
+### 提前交付规则
+
+每次确认后，只使用**全部码元都已确认的完整编码步**（数量 `K = confirmed // width`）判断可提前交付的负载。已收齐但未确认的码组、只确认了一半的码组都不参与。对走到第 `K` 步的每个可达状态，考虑到达该状态的**所有**最低代价合法前缀（不是只看全局代价最低的状态，也不是每个状态只取一个代表）。取这些前缀在负载位置上共有的最长起始段，交付其中此前没有交付的连续范围，回报里给出绝对负载起点 `start`、此次新增位 `bits` 与结束位置 `end`。这个规则既是上界也是下界：既不能猜，也不能一直积攒到结束。确认位置不变时不会重发。
+
+规则实现的等价表述：某状态在第 `j` 步“存活”当且仅当它位于至少一条从锚点（已交付前缀唯一确定的状态）到确认边界的最低代价前缀上；从锚点前向走，只有当所有存活最低代价边都取同一位时才交付该位，遇到两种位都可取即停止。
+
+### 结束与最终证据
+
+`finish(state)` 仅当总长已全部收到且全部确认才允许结束，否则拒绝且不改状态。结束时按单帧口径在**完整合法路径**中判定全局最优，继续交付全部最优负载共有的最长起始段中尚未交付的连续位；若存在歧义，不跳过缺口去交付后面碰巧一致的位，也不以字典序代表填满缺口。
+
+`finish` 报告另含 `evidence`，与对同一最终接收数组一次性调用 `process` 得到的该帧结果完全一致：`id`、字典序代表 `payload`、`selected_final_state`、精确 `optimal_paths`（Python 大整数，500 位全擦除为 `2**500`）、`ambiguous`、`state_path`、`reencoded`、`distance`、`corrected_indices` 与 `erasure_indices`。诊断中的代表只用于证据，不是交付给消费端的位。已结束状态不能再追加、替换、确认或结束。
+
+### 已交付码元的退役与交接
+
+一旦某个负载前缀交付，对应完整编码步的原始接收码元块即退出待保留的输入：状态里只保留已交付负载、每码元的 `match`/`mismatch`/`erased` 来源摘要、失配计数与一段短摘要哈希，不再保留原始观测，也无需重传。后续交付与结束诊断都由“锚点状态 + 已交付前缀 + 摘要”和尚未交付的原始块合成，绝不回看已退役坐标的原始观测；结束证据仍覆盖全部展开坐标，因为已交付位已唯一确定其期望码字。
+
+`save_state(path, state)` 复用原子新建文件 IO，拒绝覆盖已存在目标；`load_state(path)` 重载并结构校验（码元布局、已交付与确认长度、分块连续性、来源摘要一致性、结束条件等），结构不符抛 `StreamingError`。采集端在任意一次成功调用后都能把 JSON 状态交给新进程继续：接手时已确认与仍可替换的边界不变，已交付位不会重发，`finish` 证据仍覆盖已退役坐标。
