@@ -15,6 +15,16 @@ from .readback import (
     save_order,
     settle_readback,
 )
+from .protection import (
+    ProtectionError,
+    SOURCE_OBSERVED,
+    SOURCE_PROTECTED,
+    SOURCE_UNKNOWN,
+    build_protection_package,
+    complete_frames,
+    load_protection_package,
+    save_protection_package,
+)
 from .service import process
 from .session import SessionError, decode_session
 from .streaming import (
@@ -37,4 +47,7 @@ __all__ = [
     'save_state', 'load_state', 'StreamingError',
     'build_meter_facts', 'evidence_digest', 'align_meter_facts',
     'MeteringError', 'AlignmentError', 'validate_facts',
+    'build_protection_package', 'complete_frames',
+    'load_protection_package', 'save_protection_package',
+    'ProtectionError', 'SOURCE_OBSERVED', 'SOURCE_PROTECTED', 'SOURCE_UNKNOWN',
 ]
