@@ -101,3 +101,43 @@ API输入错误抛ValueError，整个结果成功计算后可用io.publish创建
 一旦某个负载前缀交付，对应完整编码步的原始接收码元块即退出待保留的输入：状态里只保留已交付负载、每码元的 `match`/`mismatch`/`erased` 来源摘要、失配计数与一段短摘要哈希，不再保留原始观测，也无需重传。后续交付与结束诊断都由“锚点状态 + 已交付前缀 + 摘要”和尚未交付的原始块合成，绝不回看已退役坐标的原始观测；结束证据仍覆盖全部展开坐标，因为已交付位已唯一确定其期望码字。
 
 `save_state(path, state)` 复用原子新建文件 IO，拒绝覆盖已存在目标；`load_state(path)` 重载并结构校验（码元布局、已交付与确认长度、分块连续性、来源摘要一致性、结束条件等），结构不符抛 `StreamingError`。采集端在任意一次成功调用后都能把 JSON 状态交给新进程继续：接手时已确认与仍可替换的边界不变，已交付位不会重发，`finish` 证据仍覆盖已退役坐标。
+
+## 本机计量事实 API（metering）
+
+`build_meter_facts(catalog, evidence)` 只消费上游已译码的单帧结果（`process(...)["frames"]` 中的对象，可来自多次调用），不接收原始码元、不调用译码器；`evidence_digest(meter_id, tick, frame_id, frame)` 供模拟上游发布者按同一口径生成摘要。输入目录是可信输入，校验只用于检出混入的旧结果、错置或改写的证据，不验证目录发布者，也不防目录与证据被一起改写。全部为普通 JSON 数据，仅用标准库，格式错误抛 `MeteringError`（`ValueError` 子类）并拒绝整批，不产生部分结果。
+
+### 测点目录与帧证据
+
+目录对象字段固定为 `inlet_meter_id`、`outlet_meter_id`、`points`：两只表 ID 均为 ident 且必须不同；每端 2..2048 个实际测点，目录总点数 4..4096，目录与证据数组均可乱序。每个测点字段固定为 `meter_id`（必须等于两个表 ID 之一）、`tick`（0..10^15 的严格整数，拒绝布尔）、`frame_id`（ident，**批内唯一**，一个帧结果只绑定一个测点）、`evidence_digest`（64 个小写十六进制字符）。同一表内同一滴答不允许两个测点。
+
+证据数组每项只消费 `id`、`payload`、`optimal_paths`、`ambiguous` 四个字段（其他诊断字段不要求、不重验）：`id` 为 ident；`payload` 为 1..64 个严格 0/1 整数（布尔拒绝）；`optimal_paths` 为 1..2^负载长度 的严格整数（布尔拒绝，上界即负载长度次方）；`ambiguous` 必须是严格布尔且与 `optimal_paths != 1` 完全一致。未知帧（证据 `id` 不属于任何测点）、重复帧、消费字段非法均拒绝整批；绝不能把不匹配或未知证据悄悄当成缺证。
+
+摘要是对数组 `[表ID, 本机滴答, id, payload, optimal_paths, ambiguous]` 用 Python 标准 JSON 紧凑序列化（`ensure_ascii=True, separators=(",", ":")`）、UTF-8 编码后取 SHA-256 的小写十六进制。表 ID、滴答与所属帧 ID 一律以测点目录为准，不从帧结果或数组位置推断。每份已提供的证据都必须与对应测点冻结的摘要完全一致，任一不匹配即拒绝整批。目录合法但某帧证据本次没到时不是格式错误：该端点记为缺证。
+
+### 本机计量事实
+
+每端按滴答排序后，**目录中实际相邻**的两个测点形成一条事实，不跳过不可读测点、不把隔点拼成区间。事实文档 `kind=telemetry_trellis.meter_facts`、`version=1`，先列入端再列出端，端内按滴答排序；每条含 `fact_id`（`inlet-fact-k`/`outlet-fact-k`，k 从 1 起）、`side`、`meter_id`、半开 `local_range`（严格正长的整数滴答区间）、两端 `endpoint_frame_ids`、两端 `endpoints`（每项 `status`/`frame_id`/`reading`）以及 `status`、`increment_ml`、`unknown_reason`。
+
+端点三态：证据未到为 `missing_evidence`；证据已核验但 `ambiguous=true` 为 `ambiguous_evidence`，不以代表负载充当读数；仅当证据已核验且最优路径唯一时为 `readable`，负载按最高位在前解释为无符号累计毫升数（64 位上界 2^64-1）。两端均可读且后值不小于前值时 `status=known`，`increment_ml` 为差值（真零也是已知覆盖，取值 0），`unknown_reason=null`；否则 `status=unknown`、`increment_ml=null`，原因区分：任一端 `missing_evidence`、任一端 `ambiguous_evidence`、两端可读但计数下降的 `decreasing_reading`（以前端点优先取因）。不推断回绕或复位。
+
+事实文档可不带任何锚点独立交付。`validate_facts(document)` 对重新导入的事实 JSON 做完整结构校验（种类/版本、表绑定、排序、半开区间、端点与增量一致性），不合规抛 `MeteringError`；对齐入口内部即调用它，且只读不改写本机事实。
+
+## 参考时间对齐 API（alignment）
+
+`align_meter_facts(facts, timing)` 使用同一批已制备事实与一份校时目录，把两只表在共同参考时间内的量对齐；同一事实可换不同校时目录重复调用，调用不需要也不接受帧证据，事实文档在任何调用后内容不变。校时格式错误抛 `AlignmentError`（`MeteringError` 子类），先于任何输出记录；合法缺证、歧义、缺少校时覆盖是数据而非错误。
+
+### 锚点与连线
+
+校时对象字段固定为 `inlet_meter_id`、`outlet_meter_id`、`inlet_anchors`、`outlet_anchors`，两个表 ID 必须与事实文档绑定一致。每端 0..4096 个锚点，每点为整数 `tick` 与整数 `reference_time`（同一原点的微秒，范围均为 0..10^15，拒绝布尔）加严格布尔 `interpolate`。按滴答排序后滴答列与参考时刻列都必须严格递增；第一个锚点的 `interpolate` 必须为假。标志为真表示允许从排序后前一个锚点**线性插值**到本点，由此形成的连线在其半开本机区间 `[前滴答, 本滴答)` 内有效，换算片段右端点时用同一连线公式；标志为假的连线不插值、不跨越；锚点覆盖范围之外不外推；单个锚点没有任何长度覆盖。
+
+### 分摊、配对与未配对
+
+每条已知本机增量按**原本机区间**长度均匀归属份额：先把原区间按可用连线切成原子片段，有映射的片段带精确参考区间，无映射的片段留在本机时间。两列已校时片段在参考时间上做归并扫描，每个非空交集生成一条 `paired` 下游事实；只有两端同时具备已知增量与映射的部分才配对，端点接触（一端区间右端等于另一端左端）不产生记录。任一侧原计量区间或所用锚点连线变化即断开。两端分别按**自己的本机子区间占原本机区间的比例**计量，绝不把跨斜率的增量直接按参考时间均摊。
+
+每条 `paired` 记录含确定性 `record_id`（`paired-0001` 起）、精确 `reference_range`，以及两端各自的 `fact_id`、`meter_id`、`endpoint_frame_ids`、所用 `anchor_segment`（含 side/meter/`segment_index`/`anchor_index`/两端滴答与两端参考时刻）、实际占用的精确本机子区间与 `share_ml`。
+
+未进入配对的份额分两类交付，均带原区间身份、实际本机子区间与精确份额：`uncalibrated`（未校时）只有本机范围，`reference_range` 与 `anchor_segment` 为 null；`calibrated_unpaired`（已校时但未配对）另给精确参考范围与所用连线，绝不解释为对侧零流量。未知区间不分摊、不配出零值，只在 `unknown_facts` 中原样列出（含 `unknown_reason`）。对每条已知事实，配对与未配对记录中属于它的本机子区间恰好覆盖原区间一次且无缝，份额之和精确等于原增量；真零增量同样遵循覆盖规则（份额全为 0 但覆盖不缺）。
+
+### 精确数、顺序与复杂度
+
+一切边界、比较与份额用精确有理数（`fractions.Fraction`），JSON 中每个有理数表达为 `{"num": 整数, "den": 正整数}`（分母为约分后的正值，整数表示为 den=1），不使用浮点、`NaN` 或 `Infinity`，因此 JSON 往返无损。输出顺序确定：配对记录按参考区间起点、终点再按两侧来源身份与本机起点排序；未配对记录先按侧（入端先于出端）、`fact_id` 再按本机起点排序，`record_id` 按该顺序连续编号（`unpaired-0001` 起）。除读取输入证据外，工作量只随输入断点与实际输出片段数增长（排序为对数开销），不逐滴答或微秒展开，也不遍历双端区间的笛卡尔积。

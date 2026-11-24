@@ -1,5 +1,12 @@
 """Domain data processing API; synthetic offline baseline."""
+from .alignment import AlignmentError, align_meter_facts
 from .archive import Archive, ArchiveError, CrashSimulated
+from .metering import (
+    MeteringError,
+    build_meter_facts,
+    evidence_digest,
+    validate_facts,
+)
 from .readback import (
     ReadbackError,
     load_continuation,
@@ -27,4 +34,6 @@ __all__ = [
     'load_continuation', 'save_order', 'ReadbackError',
     'new_state', 'append', 'replace', 'confirm', 'finish', 'progress',
     'save_state', 'load_state', 'StreamingError',
+    'build_meter_facts', 'evidence_digest', 'align_meter_facts',
+    'MeteringError', 'AlignmentError', 'validate_facts',
 ]
