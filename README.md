@@ -69,7 +69,45 @@ with Archive("run/telemetry-archive") as archive:
 PYTHONPATH=src python3 examples/archive_demo.py
 ```
 
-测试新增多站合并、撤销与版本仲裁、变更游标与发布边界、批次原子性（含提交前中断与应答丢失重开重试）、终止帧最大负载、全擦除精确路径计数等共 31 项归档/合并测试（含独立状态路径枚举Oracle），原有 `process`、编码器与文件 IO 的 6 项测试保持通过，合计 37 项。运行时仍仅依赖标准库，无第三方依赖。
+## 离线擦除位返读 API（readback）
+
+`plan_readback` 在已有帧边界的捕获上决定该申请哪些返读窗口：先按单帧口径得到原最小距离与精确最优路径数，已唯一返回`unique`、原最优负载超过32个返回`too_many_candidates`、配额内无可行集合返回`unschedulable`，否则在配额内选出总费用最低、同费用ID列表字典序最小的窗口集合（`scheduled`）。区分对象是全部原最优负载而非重编码合并集合；任意一对负载必须被至少两个选中窗口在其请求的擦除坐标上区分，以承受任一已调度窗口整窗掉包。500位帧不枚举负载（前向Viterbi代价表+后向最优后缀回溯，仅在候选≤32时枚举负载），全擦除精确计数仍为`2**500`。
+
+`scheduled`结果含接收端调度单`readback_order`（只含窗口ID、精确请求坐标、费用与总费用，不含原接收数组或候选负载）和自含的`continuation`续接资料；`schedule_id`由规范化完整请求派生，等价输入（字段或窗口目录换序）同标识，换证据或目录即换标识。续接资料可落盘后在新进程用`load_continuation`重载，`settle_readback`凭它与回包结算，不依赖旧对象、不查“最新捕获”。回包按窗口给最终结果（不可用且无位值，或请求坐标与严格0/1位值完全相等的一项）；漏报/多报窗口、未选窗口、越界坐标、跨调度资料、同坐标位值冲突一律拒绝且不产生部分结果。成功回包填入原擦除位后对整组合法路径重新译码，返回补入下标与完整单帧证据（距离、精确最优路径数、歧义、代表负载、状态路径、重编码、修正下标、剩余擦除下标）。字段与拒绝边界见 [数据契约](docs/contract.md)。
+
+```python
+from telemetry_trellis import plan_readback, settle_readback
+
+plan = plan_readback({
+    'capture_id': 'cap-1', 'constraint': 2, 'generators': [1, 2],
+    'payload_length': 3, 'terminated': True,
+    'received': [None, 0, 0, None, 0, None, 0, 0],
+    'quota': 3,
+    'windows': [
+        {'id': 'w0', 'start': 0, 'end': 4, 'fee': 1},
+        {'id': 'w1', 'start': 0, 'end': 1, 'fee': 3},
+        {'id': 'w2', 'start': 3, 'end': 6, 'fee': 2},
+    ],
+})
+# plan['selected_windows'] == ['w0', 'w2']，请求坐标分别为 [0, 3] 与 [3, 5]
+settled = settle_readback(plan['continuation'], {
+    'schedule_id': plan['schedule_id'],
+    'windows': [
+        {'window_id': 'w0', 'available': False},
+        {'window_id': 'w2', 'available': True,
+         'bits': {'3': 1, '5': 0}},
+    ],
+})
+# settled['decode']['payload'] == [1, 0, 0]，唯一最优
+```
+
+离线合成演示（含落盘、新进程重载与结算）：
+
+```sh
+PYTHONPATH=src python3 examples/readback_demo.py
+```
+
+测试新增多站合并、撤销与版本仲裁、变更游标与发布边界、批次原子性（含提交前中断与应答丢失重开重试）、终止帧最大负载、全擦除精确路径计数等共 31 项归档/合并测试（含独立状态路径枚举Oracle），原有 `process`、编码器与文件 IO 的 6 项测试保持通过。返读 API 另增 24 项测试：覆盖配额/费用字典序选窗、整窗掉盘的两窗口区分保证、选窗与最优负载枚举的穷举Oracle、同码字不可调度、32候选边界、跨调度与全部非法回包拒绝、位值冲突不投票、拒绝时无部分结果且不改原输入、落盘后以 `python -I` 新进程重载结算、500位全擦除`2**500`与500位小量并列的实际调度/再译码，合计 61 项。运行时仍仅依赖标准库，无第三方依赖。
 
 ## 当前边界与来源
 

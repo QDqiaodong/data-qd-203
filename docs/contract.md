@@ -28,3 +28,40 @@ API输入错误抛ValueError，整个结果成功计算后可用io.publish创建
 下游发布只认唯一最优路径。比较整批提交前后，每帧至多一条变更：无→有`write`、有效负载变为另一值`replace`、有→无`revoke`；唯一负载不变时即使版本、代价或不符位置变化也只更新证据、不发事件。批内中间译码状态不产生事件。变更保存全库从1起连续递增的`seq`、`frame_id`、`type`、`previous_seq`（此前无有效发布为null）；`write`/`replace`带`payload`，`revoke`不带。同批多事件按frame_id字典序分配序号。已发历史条目不可改写，也不能从当前证据重建旧负载。
 
 观测与版本、下游变更、批次回执在一次原子提交内一起生效。回执至少含`batch_id`与本批实际`changes`（无变更也保存）。重试规则：先做格式校验，再以字段顺序无关、数组顺序有意义的规范化JSON比较请求内容；相同`batch_id`相同内容直接返回原回执（在重新做业务判断之前），相同ID异内容拒绝。同ID异内容、格式错误、新批次业务冲突均拒绝，不留部分更新、回执或跳号。重开后可继续查证据、拉变更或安全重试；只认完整提交，不负责修复介质损坏。`crash`参数（`staged`/`replaced`/`synced`）仅供测试在持久化边界模拟进程中断。
+
+## 离线擦除位返读 API（readback）
+
+`plan_readback(request)` 面向一个已有帧边界的`capture_id`（ident约束），在不连接设备、不改变现有单帧契约的前提下决定该申请哪些返读窗口；`settle_readback(continuation, reply, original_request=None)` 在另一处理进程凭保存的续接资料把实际回包并入发起时的捕获并按现有单帧口径重新译码。全部为普通JSON数据，仅用标准库。
+
+### 发起请求与窗口
+
+请求字段固定为 `capture_id`、`constraint`、`generators`、`payload_length`、`terminated`、`received`（参数范围、长度与严格0/1/null、生成元顺序、合法路径完全沿用单帧契约，布尔整数拒绝）、整数`quota`（0..16000，拒绝bool）和`windows`（1..16项）。每个窗口字段固定为 `id`（ident，全目录唯一）、整数`start`/`end`（0..码元总数，半开`[start,end)`非空且不越界，拒绝bool）与整数`fee`（1..1000，拒绝bool）。区间允许重叠，目录顺序没有业务含义；窗口实际请求坐标只是区间内在本次原始`received`中为null的位置，已知位永不返读，可能为空列表（该窗口仍合法但不区分任何候选）。
+
+先用现有单帧Viterbi口径得到原最小汉明距离`distance`与精确最优路径数`optimal_paths`（Python大整数，500位全擦除帧可得到`2**500`，不枚举负载、不截断）。结果`status`四态可区分：
+
+- `unique`：原输入已唯一最优，无需返读，不产生调度单。
+- `too_many_candidates`：原最优**负载**数超过32（按去重后的负载计，多条同码字路径先去重；路径计数仍给精确值），不产生调度。
+- `unschedulable`：候选可处理但配额内不存在满足保证的窗口集合，不下发近似结果。
+- `scheduled`：给出费用最低的可行窗口集合。
+
+无调度结果统一带原`distance`与`optimal_paths`，且`schedule_id`、`readback_order`、`continuation`为null、`selected_windows`为空、`total_fee`为0。
+
+### 区分保证与选窗优化
+
+需要互相区分的是**全部原最优负载**，不是按重编码合并后的集合；若两条最优负载的码字完全相同（任何擦除位都不可分），直接不可调度。对任意一对原最优负载，一个窗口仅当它请求的某个擦除坐标上两负载重编码值不同时，才算能区分该对。可行集合必须使每一对负载被至少两个选中窗口区分：这样即使任意一个已调度窗口整个没有回包，剩余窗口在各自请求坐标上仍能区分它们；一个窗口内有多处差异也只抵得住该窗口以外的掉包。调度保证只针对原最优负载与窗口覆盖，不承诺实际读回值符合这些负载。
+
+在`quota`总费用内枚举窗口子集（最多16个，逐对维护覆盖计数并做不可行剪枝），选满足每对≥2覆盖的总费用最低集合；同费用选按窗口ID升序排列后字典序较小的ID列表。500位上限不枚举负载：最优负载只在数量≤32时，用前向Viterbi代价表加后向最优后缀表沿最优边回溯取得。
+
+### 调度标识、调度单与续接资料
+
+`schedule_id`为`rb-`加规范化完整请求SHA-256摘要前32位十六进制。规范化JSON对对象字段排序、窗口目录按ID排序，但保留有业务顺序的数组（`generators`、`received`、请求坐标）。因此等价输入（仅对象字段或窗口目录换序）产生相同标识；改接收证据、窗口目录或任何参数即产生不同标识，新资料不能当旧单使用。标识绑定发起时的完整请求，而非只绑定捕获ID或选中窗口。
+
+`scheduled`结果另交付两份JSON：`readback_order`（接收端调度单，含`kind=telemetry_trellis.readback_order`、版本、`schedule_id`、`capture_id`、选中窗口ID与各自**精确请求坐标**及费用、总费用；不含原接收数组或候选负载）与`continuation`（调用方保存的续接资料，含`kind=telemetry_trellis.readback_continuation`、版本、标识、内嵌的完整原始请求、选中窗口ID、总费用与原距离/路径数）。`save_order(path, order)`与`save_continuation(path, continuation)`复用原子新建文件IO，拒绝覆盖已存在目标；`load_continuation(path)`重载并结构校验，返回续接字典。续接资料自含所需原始数据，因此新进程无需旧对象存活、也不查询“最新捕获”；也可向`settle_readback`另传`original_request`，缺失字段或规范化后不匹配即报`ReadbackError`。绑定用于检测误配，不抗恶意伪造。
+
+### 回包归并、再译码与拒绝边界
+
+回包为对象`{"schedule_id": <string>, "windows": [...]}`，窗口顺序无关，每个**选中**窗口恰一项、不多不少：`{"window_id", "available": true/false, "bits"?}`。`available=false`不得带任何位值；`available=true`必须给`bits`对象，键为该窗口调度时请求坐标的十进制字符串、值为严格0/1整数（拒绝bool），坐标集合与请求**完全相等**、每个坐标恰一次。冒用未选窗口、漏报/多报窗口、重复项、坐标越出该窗口请求、不同调度的资料（`schedule_id`不符）、续接资料被改到与自身标识不一致，全部抛`ReadbackError`。所有结构与绑定校验先于任何合并完成，任何非法数据都不产生部分结算，也不修改原输入或已保存资料。
+
+多个成功窗口覆盖同一坐标只产生一份观测：值相同合并为一份；值冲突则拒绝整次结算，不择一、不投票。只把成功回包填入原帧对应擦除位，其余码元（含不可用窗口覆盖的位置）保持原样；结算不会写向原本已知的位。
+
+结算返回`schedule_id`、`capture_id`、`filled_indices`（实际补入的展开下标，去重升序）、`unavailable_windows`（升序）与`decode`，后者完全是现有单帧译码证据：`distance`、精确`optimal_paths`、`ambiguous`、字典序代表`payload`、`selected_final_state`、`state_path`、`reencoded`、`corrected_indices`、`erasure_indices`。允许任意多个窗口不可用，仍用实际拿到的证据。再译码对补完观测后的**整组合法路径**重新判断，而不是只在原最优负载中筛选，因此原先不最优的路径可能进入并列，结果也不保证唯一。
